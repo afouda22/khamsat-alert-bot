@@ -20,9 +20,9 @@ if sys.platform == "win32":
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
-SEEN_FILE = os.path.join(SCRIPT_DIR, "seen_requests.json")
+STATE_FILE = os.path.join(SCRIPT_DIR, "bot_state.json")
 
-# Simple HTTP handler for Render keep-alive and health check
+# Simple HTTP handler for keep-alive & health check
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -31,7 +31,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write("Khamsat Alert Bot is Running 24/7!\n".encode("utf-8"))
 
     def log_message(self, format, *args):
-        # Silence access logs to keep terminal clean
         return
 
 def run_health_server(port):
@@ -52,22 +51,23 @@ def load_config():
             pass
     return cfg
 
-def load_seen_ids():
-    if os.path.exists(SEEN_FILE):
+def load_state():
+    if os.path.exists(STATE_FILE):
         try:
-            with open(SEEN_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("max_id", 0), set(data.get("seen_ids", []))
         except Exception:
-            return set()
-    return set()
+            pass
+    return 0, set()
 
-def save_seen_ids(seen_ids):
+def save_state(max_id, seen_ids):
     trimmed = list(seen_ids)[-300:]
     try:
-        with open(SEEN_FILE, "w", encoding="utf-8") as f:
-            json.dump(trimmed, f)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"max_id": max_id, "seen_ids": trimmed}, f)
     except Exception as e:
-        print(f"[-] Error saving seen IDs: {e}")
+        print(f"[-] Error saving state: {e}")
 
 def send_telegram_message(token, chat_id, message_html):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -136,6 +136,11 @@ def fetch_requests():
         })
     return items
 
+def is_old_time(time_str):
+    # Reject anything created hours, days, or months ago
+    old_indicators = ["يوم", "ايام", "أيام", "ساعة", "ساعات", "شهر", "أشهر", "اسبوع", "أسبوع"]
+    return any(ind in time_str for ind in old_indicators)
+
 def matches_keywords(title, keywords):
     if not keywords:
         return True
@@ -148,7 +153,6 @@ def main():
     chat_id = os.environ.get("CHAT_ID") or config.get("chat_id", "").strip()
     interval = int(os.environ.get("CHECK_INTERVAL") or config.get("check_interval_seconds", 30))
     
-    # Keywords from env (comma separated) or config
     env_kw = os.environ.get("KEYWORDS")
     if env_kw:
         keywords = [k.strip() for k in env_kw.split(",") if k.strip()]
@@ -159,7 +163,6 @@ def main():
         print("[-] خطأ: لم يتم العثور على BOT_TOKEN أو CHAT_ID في config.json أو متغيرات البيئة.")
         sys.exit(1)
 
-    # Start lightweight web server for Render / Cloud port binding & keep-alive
     port = int(os.environ.get("PORT", 10000))
     t = threading.Thread(target=run_health_server, args=(port,), daemon=True)
     t.start()
@@ -170,34 +173,24 @@ def main():
     if keywords:
         print(f"🔍 فلترة الكلمات المفتاحية: {', '.join(keywords)}")
     else:
-        print("🔔 يتم مراقبة جميع الطلبات بدون فلترة")
+        print("🔔 يتم مراقبة جميع الطلبات الجديدة لحظة بلحظة")
     print("=" * 60)
 
-    seen_ids = load_seen_ids()
+    max_seen_id, seen_ids = load_state()
 
-    # Initial scan
-    print("[*] جاري فحص الصفحة الحالية لأول مرة...")
+    # Initial baseline scan
+    print("[*] جاري فحص الصفحة الحالية لتحديد أعلى رقم طلب حالي...")
     try:
         current_items = fetch_requests()
         for item in current_items:
             seen_ids.add(item["id"])
-        save_seen_ids(seen_ids)
-        print(f"[✓] تم حفظ {len(current_items)} طلب قديم لتجنب الإزعاج بالطلبات السابقة.")
+            if item["id"] > max_seen_id:
+                max_seen_id = item["id"]
+        save_state(max_seen_id, seen_ids)
+        print(f"[✓] أعلى رقم طلب حالي هو: #{max_seen_id}")
+        print(f"[✓] تم حفظ الطلبات القديمة. لن يتم إرسال إلا الطلبات الجديدة المنشورة بعد الآن فقط!")
     except Exception as e:
         print(f"[-] خطأ أثناء الفحص الأولي: {e}")
-
-    # Send startup message to user
-    startup_msg = (
-        "🚀 <b>تم تشغيل رادار طلبات خمسات بنجاح في السحاب!</b>\n\n"
-        f"⏱️ <b>معدل الفحص:</b> كل {interval} ثانية\n"
-        + (f"🔍 <b>الفلترة مفعلة على:</b> {', '.join(keywords)}\n" if keywords else "🔔 <b>الفلترة:</b> مراقبة كل الطلبات الجديدة\n")
-        + "\n<i>البوت سيعمل الآن 24/7 دون الحاجة لتشغيل الكمبيوتر!</i> ⚡"
-    )
-    ok, resp = send_telegram_message(token, chat_id, startup_msg)
-    if ok:
-        print("[✓] تم إرسال رسالة تفعيل للبوت على تليجرام بنجاح!")
-    else:
-        print(f"[!] تنبيه: تعذر إرسال رسالة التفعيل: {resp}")
 
     # Main monitoring loop
     print("\n[*] جاري بدء المراقبة المستمرة...")
@@ -207,12 +200,29 @@ def main():
             items = fetch_requests()
             now_str = datetime.now().strftime("%H:%M:%S")
 
-            new_items = [it for it in items if it["id"] not in seen_ids]
-
-            if new_items:
-                print(f"[{now_str}] 🎯 تم اكتشاف {len(new_items)} طلب جديد!")
-                for it in reversed(new_items):
+            # Filter:
+            # 1. ID must not be seen before
+            # 2. ID must be GREATER than max_seen_id (prevents old bumped posts)
+            # 3. Time must NOT be old (no hours/days ago)
+            new_genuine_items = []
+            for it in items:
+                if it["id"] not in seen_ids:
                     seen_ids.add(it["id"])
+                    if it["id"] > max_seen_id and not is_old_time(it["time"]):
+                        new_genuine_items.append(it)
+                    else:
+                        # Old topic that was bumped by a reply
+                        print(f"[{now_str}] [تخطي] تم تجاهل طلب قديم تم الرد عليه: #{it['id']} ({it['time']}) - {it['title'][:30]}")
+
+            if new_genuine_items:
+                print(f"[{now_str}] 🎯 تم اكتشاف {len(new_genuine_items)} طلب جديد فعلاً!")
+                # Sort oldest first so telegram gets them in chronological order
+                new_genuine_items.sort(key=lambda x: x["id"])
+
+                for it in new_genuine_items:
+                    if it["id"] > max_seen_id:
+                        max_seen_id = it["id"]
+
                     if matches_keywords(it["title"], keywords):
                         alert_msg = (
                             "🚨 <b>طلب جديد في خمسات!</b>\n\n"
@@ -229,7 +239,7 @@ def main():
                     else:
                         print(f"    [i] تم تخطي الطلب (لا يطابق الكلمات المفتاحية): {it['title'][:40]}")
                 
-                save_seen_ids(seen_ids)
+                save_state(max_seen_id, seen_ids)
             else:
                 print(f"[{now_str}] لا توجد طلبات جديدة. الفحص القادم بعد {interval} ثانية...")
 
