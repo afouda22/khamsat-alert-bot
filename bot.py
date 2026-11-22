@@ -11,10 +11,16 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
-# Ensure utf-8 encoding for console output on Windows
+# Prevent Windows console from freezing on mouse click (Disable QuickEdit Mode)
 if sys.platform == "win32":
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        hStdIn = kernel32.GetStdHandle(-10)
+        mode = ctypes.c_ulong()
+        kernel32.GetConsoleMode(hStdIn, ctypes.byref(mode))
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        kernel32.SetConsoleMode(hStdIn, mode.value & ~ENABLE_QUICK_EDIT_MODE)
     except Exception:
         pass
 
@@ -25,8 +31,8 @@ if sys.platform == "win32":
         ES_CONTINUOUS = 0x80000000
         ES_SYSTEM_REQUIRED = 0x00000001
         ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
-    except Exception as e:
-        print(f"[-] تنبيه بشأن إعدادات الطاقة: {e}")
+    except Exception:
+        pass
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
@@ -46,7 +52,7 @@ def run_health_server(port):
     try:
         server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
         server.serve_forever()
-    except Exception as e:
+    except Exception:
         pass
 
 def load_config():
@@ -84,7 +90,7 @@ def send_telegram_message(token, chat_id, message_html):
         "text": message_html,
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
-        "disable_notification": False  # Force sound notification
+        "disable_notification": False
     }
     data = json.dumps(payload).encode("utf-8")
     headers = {
@@ -136,7 +142,6 @@ def fetch_requests():
         id_match = re.search(r'/requests/(\d+)', href)
         post_id = int(id_match.group(1)) if id_match else 0
 
-        # Jump directly to the add comment box with #add_comment
         full_link = f"https://khamsat.com{href}#add_comment"
         items.append({
             "id": post_id,
@@ -167,9 +172,9 @@ def dispatch_alert(token, chat_id, it):
     )
     s_ok, s_err = send_telegram_message(token, chat_id, alert_msg)
     if s_ok:
-        print(f"    [⚡] تم إرسال إشعار فوري: {it['title'][:40]}...")
+        print(f"\n[⚡ SENT TO TELEGRAM] {it['title']} (#{it['id']})")
     else:
-        print(f"    [-] فشل إرسال الإشعار للطلب {it['id']}: {s_err}")
+        print(f"\n[-] Failed to send alert for #{it['id']}: {s_err}")
     return s_ok
 
 def main():
@@ -185,7 +190,7 @@ def main():
         keywords = config.get("keywords", [])
 
     if not token or not chat_id:
-        print("[-] خطأ: لم يتم العثور على BOT_TOKEN أو CHAT_ID في config.json أو متغيرات البيئة.")
+        print("[-] Error: BOT_TOKEN or CHAT_ID missing.")
         sys.exit(1)
 
     port = int(os.environ.get("PORT", 10000))
@@ -193,35 +198,34 @@ def main():
     t.start()
 
     print("=" * 60)
-    print("⚡ تم تشغيل رادار طلبات خمسات السريع (Ultra Fast)")
-    print(f"⏱️ معدل الفحص فائق السرعة: كل {interval} ثوانٍ فقط!")
-    print("[✓] نظام منع وضع السكون مفعّل (الجهاز لن يدخل في Sleep)")
+    print(">> KHAMSAT RADAR BOT - ACTIVE & SCANNING")
+    print(f">> Interval: Every {interval} seconds")
+    print(">> Sleep Prevention: ENABLED (PC will stay awake)")
+    print(">> QuickEdit Freezing: DISABLED (Clicks won't pause bot)")
     if keywords:
-        print(f"🔍 فلترة الكلمات المفتاحية: {', '.join(keywords)}")
+        print(f">> Keywords filter: {', '.join(keywords)}")
     else:
-        print("🔔 مراقبة جميع الطلبات الجديدة فور صدورها")
+        print(">> Monitoring: ALL new requests")
     print("=" * 60)
 
     max_seen_id, seen_ids = load_state()
 
-    print("[*] جاري فحص الصفحة الحالية...")
     try:
         current_items = fetch_requests()
-
         if max_seen_id == 0:
             for item in current_items:
                 seen_ids.add(item["id"])
                 if item["id"] > max_seen_id:
                     max_seen_id = item["id"]
             save_state(max_seen_id, seen_ids)
-            print(f"[✓] التشغيل الأول: تم تحديد خط الأساس عند الطلب #{max_seen_id}")
+            print(f"[✓] Initialized baseline at #{max_seen_id}")
         else:
             catch_up_items = [
                 it for it in current_items
                 if it["id"] > max_seen_id and it["id"] not in seen_ids and not is_old_time(it["time"])
             ]
             if catch_up_items:
-                print(f"[🎯] تم العثور على {len(catch_up_items)} طلب جديد! جاري الإرسال...")
+                print(f"[🎯] Found {len(catch_up_items)} missed new request(s)! Sending to Telegram...")
                 catch_up_items.sort(key=lambda x: x["id"])
                 for it in catch_up_items:
                     seen_ids.add(it["id"])
@@ -236,14 +240,15 @@ def main():
                 save_state(max_seen_id, seen_ids)
 
     except Exception as e:
-        print(f"[-] خطأ أثناء الفحص: {e}")
+        print(f"[-] Init error: {e}")
 
-    # Main monitoring loop
-    print(f"\n[*] بدأ الرادار الفحص الفوري (كل {interval} ثوانٍ)...")
+    print("\n[*] Live monitoring started. Awaiting new requests...")
+    scan_count = 0
     while True:
         try:
             time.sleep(interval)
             items = fetch_requests()
+            scan_count += 1
             now_str = datetime.now().strftime("%H:%M:%S")
 
             new_genuine_items = []
@@ -254,9 +259,7 @@ def main():
                         new_genuine_items.append(it)
 
             if new_genuine_items:
-                print(f"[{now_str}] 🎯 تم رصد {len(new_genuine_items)} طلب جديد لحظياً!")
                 new_genuine_items.sort(key=lambda x: x["id"])
-
                 for it in new_genuine_items:
                     if it["id"] > max_seen_id:
                         max_seen_id = it["id"]
@@ -265,13 +268,18 @@ def main():
                         dispatch_alert(token, chat_id, it)
                 
                 save_state(max_seen_id, seen_ids)
+            else:
+                # Live dynamic counter on the same line so the user sees it's actively ticking!
+                sys.stdout.write(f"\r[STATUS: RUNNING] Last scan: {now_str} | Scans: {scan_count} | Monitoring Khamsat...")
+                sys.stdout.flush()
 
         except KeyboardInterrupt:
-            print("\n[!] تم إيقاف البوت بواسطة المستخدم.")
+            print("\n[!] Bot stopped by user.")
             break
         except Exception as e:
             now_str = datetime.now().strftime("%H:%M:%S")
-            print(f"[{now_str}] تنبيه شبكة: {e}. جاري إعادة المحاولة خلال {interval} ثوانٍ...")
+            sys.stdout.write(f"\r[RETRY: {now_str}] Network notice: {e}. Retrying in {interval}s...")
+            sys.stdout.flush()
 
 if __name__ == "__main__":
     main()
