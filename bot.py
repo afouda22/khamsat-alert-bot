@@ -18,11 +18,21 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# Prevent Windows from entering Sleep automatically while the bot is running
+# This allows the screen/display to turn off safely while keeping the CPU & Wi-Fi awake!
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+    except Exception as e:
+        print(f"[-] تنبيه بشأن إعدادات الطاقة: {e}")
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 STATE_FILE = os.path.join(SCRIPT_DIR, "bot_state.json")
 
-# Simple HTTP handler for keep-alive & health check
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -36,10 +46,9 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 def run_health_server(port):
     try:
         server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-        print(f"[✓] تم تشغيل خادم المراقبة على المنفذ {port}")
         server.serve_forever()
     except Exception as e:
-        print(f"[-] خطأ في تشغيل خادم المراقبة: {e}")
+        pass
 
 def load_config():
     cfg = {}
@@ -137,8 +146,9 @@ def fetch_requests():
     return items
 
 def is_old_time(time_str):
-    # Reject anything created hours, days, or months ago
-    old_indicators = ["يوم", "ايام", "أيام", "ساعة", "ساعات", "شهر", "أشهر", "اسبوع", "أسبوع"]
+    # Only reject posts that are days or months old
+    # Posts published within minutes or recent hours should NOT be rejected
+    old_indicators = ["يوم", "ايام", "أيام", "شهر", "أشهر", "اسبوع", "أسبوع"]
     return any(ind in time_str for ind in old_indicators)
 
 def matches_keywords(title, keywords):
@@ -146,6 +156,21 @@ def matches_keywords(title, keywords):
         return True
     title_lower = title.lower()
     return any(kw.lower() in title_lower for kw in keywords)
+
+def dispatch_alert(token, chat_id, it):
+    alert_msg = (
+        "🚨 <b>طلب جديد في خمسات!</b>\n\n"
+        f"📌 <b>العنوان:</b> {html.escape(it['title'])}\n"
+        f"👤 <b>الناشر:</b> {html.escape(it['user'])}\n"
+        f"⏱️ <b>الوقت:</b> {html.escape(it['time'])}\n\n"
+        f"👉 <a href=\"{it['url']}\">اضغط هنا لفتح الطلب والتقديم فوراً 🚀</a>"
+    )
+    s_ok, s_err = send_telegram_message(token, chat_id, alert_msg)
+    if s_ok:
+        print(f"    [✓] تم إرسال الإشعار لتليجرام: {it['title'][:40]}...")
+    else:
+        print(f"    [-] فشل إرسال الإشعار للطلب {it['id']}: {s_err}")
+    return s_ok
 
 def main():
     config = load_config()
@@ -170,6 +195,7 @@ def main():
     print("=" * 60)
     print("🚀 تم تشغيل بوت رادار طلبات خمسات (Khamsat Alert Bot)")
     print(f"⏱️ معدل الفحص: كل {interval} ثانية")
+    print("[✓] تم تفعيل نظام منع وضع السكون (Sleep Prevention): الجهاز لن يدخل في Sleep أثناء التشغيل")
     if keywords:
         print(f"🔍 فلترة الكلمات المفتاحية: {', '.join(keywords)}")
     else:
@@ -178,17 +204,41 @@ def main():
 
     max_seen_id, seen_ids = load_state()
 
-    # Initial baseline scan
-    print("[*] جاري فحص الصفحة الحالية لتحديد أعلى رقم طلب حالي...")
+    print("[*] جاري فحص الصفحة الحالية...")
     try:
         current_items = fetch_requests()
-        for item in current_items:
-            seen_ids.add(item["id"])
-            if item["id"] > max_seen_id:
-                max_seen_id = item["id"]
-        save_state(max_seen_id, seen_ids)
-        print(f"[✓] أعلى رقم طلب حالي هو: #{max_seen_id}")
-        print(f"[✓] تم حفظ الطلبات القديمة. لن يتم إرسال إلا الطلبات الجديدة المنشورة بعد الآن فقط!")
+
+        if max_seen_id == 0:
+            # First time running the bot ever: seed existing items so no initial spam
+            for item in current_items:
+                seen_ids.add(item["id"])
+                if item["id"] > max_seen_id:
+                    max_seen_id = item["id"]
+            save_state(max_seen_id, seen_ids)
+            print(f"[✓] التشغيل الأول: تم تحديد خط الأساس عند الطلب #{max_seen_id}")
+        else:
+            # Returning session: catch-up on any fresh items published while bot was off!
+            catch_up_items = [
+                it for it in current_items
+                if it["id"] > max_seen_id and it["id"] not in seen_ids and not is_old_time(it["time"])
+            ]
+            if catch_up_items:
+                print(f"[🎯] تم العثور على {len(catch_up_items)} طلب جديد نزل أثناء توقف البوت! جاري إرسالها...")
+                catch_up_items.sort(key=lambda x: x["id"])
+                for it in catch_up_items:
+                    seen_ids.add(it["id"])
+                    if it["id"] > max_seen_id:
+                        max_seen_id = it["id"]
+                    if matches_keywords(it["title"], keywords):
+                        dispatch_alert(token, chat_id, it)
+                save_state(max_seen_id, seen_ids)
+            else:
+                print(f"[✓] البوت يعمل. أعلى طلب مسجل: #{max_seen_id}")
+                # Update seen_ids with current items to avoid bumping
+                for it in current_items:
+                    seen_ids.add(it["id"])
+                save_state(max_seen_id, seen_ids)
+
     except Exception as e:
         print(f"[-] خطأ أثناء الفحص الأولي: {e}")
 
@@ -200,10 +250,6 @@ def main():
             items = fetch_requests()
             now_str = datetime.now().strftime("%H:%M:%S")
 
-            # Filter:
-            # 1. ID must not be seen before
-            # 2. ID must be GREATER than max_seen_id (prevents old bumped posts)
-            # 3. Time must NOT be old (no hours/days ago)
             new_genuine_items = []
             for it in items:
                 if it["id"] not in seen_ids:
@@ -211,12 +257,10 @@ def main():
                     if it["id"] > max_seen_id and not is_old_time(it["time"]):
                         new_genuine_items.append(it)
                     else:
-                        # Old topic that was bumped by a reply
-                        print(f"[{now_str}] [تخطي] تم تجاهل طلب قديم تم الرد عليه: #{it['id']} ({it['time']}) - {it['title'][:30]}")
+                        print(f"[{now_str}] [تخطي] موضوع قديم تم التعليق عليه: #{it['id']} ({it['time']})")
 
             if new_genuine_items:
                 print(f"[{now_str}] 🎯 تم اكتشاف {len(new_genuine_items)} طلب جديد فعلاً!")
-                # Sort oldest first so telegram gets them in chronological order
                 new_genuine_items.sort(key=lambda x: x["id"])
 
                 for it in new_genuine_items:
@@ -224,18 +268,7 @@ def main():
                         max_seen_id = it["id"]
 
                     if matches_keywords(it["title"], keywords):
-                        alert_msg = (
-                            "🚨 <b>طلب جديد في خمسات!</b>\n\n"
-                            f"📌 <b>العنوان:</b> {html.escape(it['title'])}\n"
-                            f"👤 <b>الناشر:</b> {html.escape(it['user'])}\n"
-                            f"⏱️ <b>الوقت:</b> {html.escape(it['time'])}\n\n"
-                            f"👉 <a href=\"{it['url']}\">اضغط هنا لفتح الطلب والتقديم فوراً 🚀</a>"
-                        )
-                        s_ok, s_err = send_telegram_message(token, chat_id, alert_msg)
-                        if s_ok:
-                            print(f"    [✓] تم الإرسال: {it['title'][:40]}...")
-                        else:
-                            print(f"    [-] فشل إرسال الإشعار للطلب {it['id']}: {s_err}")
+                        dispatch_alert(token, chat_id, it)
                     else:
                         print(f"    [i] تم تخطي الطلب (لا يطابق الكلمات المفتاحية): {it['title'][:40]}")
                 
